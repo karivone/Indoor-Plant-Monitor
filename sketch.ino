@@ -1,142 +1,225 @@
-#include "DHT.h"
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <DHT.h>
-///////////////////////////
-#define RED_PIN 18
-#define GREEN_PIN 19
-// Wifi credentials
-//const char* ssid="Wokwi-GUEST"
+#include <ThingSpeak.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
 
-// 1. WiFi credentials
-const char* ssid = "Wokwi-GUEST";
-const char* password = "";
+// --- Wokwi Virtual Wi-Fi Settings ---
+const char* WIFI_SSID     = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
 
-// 2. ThingSpeak Write API Key
-String apiKey = "091M67876OKG0SDT";
+// --- ThingSpeak Configuration ---
+unsigned long myChannelNumber = 3572114; 
+const char* myWriteAPIKey     = "FSBABX35I3STB53W";
 
-/////////////////////////////
-// DHT Sensor configuration
-#define DHTPIN 5
-#define DHTTYPE DHT22
+// --- Pin Assignments ---
+#define DHTPIN        4
+#define DHTTYPE       DHT22
+
+#define PIN_GREEN_LED 19
+#define PIN_RED_LED   18
+#define PIN_BUZZER    21
+
+// --- I2C LCD Pins ---
+#define I2C_SDA       17
+#define I2C_SCL       16
+
+// --- Thresholds ---
+const float TEMP_MIN = 18.0;
+const float TEMP_MAX = 30.0;
+
+// --- Timing Controls (Non-blocking) ---
+const unsigned long SENSOR_INTERVAL = 2000;   // Read sensor every 2 seconds
+const unsigned long CLOUD_INTERVAL  = 20000;  // Upload every 20 seconds
+
+unsigned long lastSensorRead = 0;
+unsigned long lastCloudSend  = 0;
 
 DHT dht(DHTPIN, DHTTYPE);
-// Initialize LCD (Address: 0x27, 16 Columns, 2 Rows)
-// Note: If 0x27 doesn't display anything on physical hardware, try 0x3F.
+WiFiClient client;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+enum PlantStatus {
+  HEALTHY,
+  TOO_COLD,
+  TOO_HOT,
+  SENSOR_ERROR
+};
+
+PlantStatus currentStatus = HEALTHY;
+float currentTemp = 0.0;
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected to network.");
+  } else {
+    Serial.println("\n[WiFi] Connection timeout. Retrying next cycle.");
+  }
+}
+
+void triggerAlarm(bool hot) {
+  if (hot) {
+    // Too Hot: 3 rapid beeps
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(PIN_BUZZER, HIGH);
+      delay(120);
+      digitalWrite(PIN_BUZZER, LOW);
+      delay(80);
+    }
+  } else {
+    // Too Cold: 2 longer warning beeps
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(PIN_BUZZER, HIGH);
+      delay(250);
+      digitalWrite(PIN_BUZZER, LOW);
+      delay(150);
+    }
+  }
+}
+
+void updateLCD(float temp, PlantStatus status) {
+  lcd.setCursor(0, 0);
+  if (status == SENSOR_ERROR) {
+    lcd.print("Temp: ERROR     ");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Sensor!   ");
+    return;
+  }
+
+  // Row 1: Temperature display
+  char tempBuffer[17];
+  snprintf(tempBuffer, sizeof(tempBuffer), "Temp: %.1f C    ", temp);
+  lcd.print(tempBuffer);
+
+  // Row 2: Status display
+  lcd.setCursor(0, 1);
+  if (status == HEALTHY) {
+    lcd.print("Status: OPTIMAL ");
+  } else if (status == TOO_HOT) {
+    lcd.print("Status: TOO HOT!");
+  } else if (status == TOO_COLD) {
+    lcd.print("Status: TOO COLD");
+  }
+}
+
+void evaluatePlantConditions(float temp) {
+  if (isnan(temp)) {
+    currentStatus = SENSOR_ERROR;
+    Serial.println("[ERROR] Failed to read from DHT22!");
+    updateLCD(0.0, currentStatus);
+    return;
+  }
+
+  if (temp < TEMP_MIN) {
+    currentStatus = TOO_COLD;
+    digitalWrite(PIN_GREEN_LED, LOW);
+    digitalWrite(PIN_RED_LED, HIGH);
+    Serial.printf("Temperature: %.1f°C | Status: TOO COLD\n", temp);
+    updateLCD(temp, currentStatus);
+    triggerAlarm(false);
+  } 
+  else if (temp > TEMP_MAX) {
+    currentStatus = TOO_HOT;
+    digitalWrite(PIN_GREEN_LED, LOW);
+    digitalWrite(PIN_RED_LED, HIGH);
+    Serial.printf("Temperature: %.1f°C | Status: TOO HOT\n", temp);
+    updateLCD(temp, currentStatus);
+    triggerAlarm(true);
+  } 
+  else {
+    currentStatus = HEALTHY;
+    digitalWrite(PIN_GREEN_LED, HIGH);
+    digitalWrite(PIN_RED_LED, LOW);
+    digitalWrite(PIN_BUZZER, LOW);
+    Serial.printf("Temperature: %.1f°C | Status: HEALTHY\n", temp);
+    updateLCD(temp, currentStatus);
+  }
+}
+
+void sendTelemetry(float temp, PlantStatus status) {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    return;
+  }
+
+  ThingSpeak.setField(1, temp);
+
+  int statusCode = (status == HEALTHY) ? 1 : (status == TOO_HOT ? 2 : 3);
+  ThingSpeak.setField(2, statusCode);
+
+  String statusMsg = (status == HEALTHY) ? "Healthy" : (status == TOO_HOT ? "Too Hot" : "Too Cold");
+  ThingSpeak.setStatus(statusMsg);
+
+  int response = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+  if (response == 200) {
+    Serial.println("[Cloud] Data uploaded successfully to ThingSpeak.");
+  } else {
+    Serial.printf("[Cloud] Upload failed with HTTP code %d\n", response);
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting ESP32...");
-//initializs pins
-pinMode(RED_PIN, OUTPUT);
-  pinMode(GREEN_PIN, OUTPUT);
-  // Initialize DHT sensor
-  dht.begin();
 
-  // Initialize LCD
-  Wire.begin(21, 22); // SDA = GPIO 21, SCL = GPIO 22
+  pinMode(PIN_GREEN_LED, OUTPUT);
+  pinMode(PIN_RED_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  // Start I2C bus with defined SDA/SCL pins
+  Wire.begin(I2C_SDA, I2C_SCL);
   lcd.init();
   lcd.backlight();
 
-  // Display initial status
+  // Boot Splash Screen
   lcd.setCursor(0, 0);
   lcd.print("GROUP 3: PROJECT");
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
-  delay(2000);
+
+  // Self-test LED indicator
+  digitalWrite(PIN_GREEN_LED, HIGH);
+  digitalWrite(PIN_RED_LED, HIGH);
+  delay(1000);
+  digitalWrite(PIN_GREEN_LED, LOW);
+  digitalWrite(PIN_RED_LED, LOW);
+
   lcd.clear();
-  delay(2000);
+
+  dht.begin();
+  connectWiFi();
+  ThingSpeak.begin(client);
+
+  Serial.println("--- System Initialized ---");
 }
 
 void loop() {
-  // Read sensor values
-  float humidity = dht.readHumidity();
-  float temperature = dht.readTemperature();
+  unsigned long now = millis();
 
-  // Check if readings failed
-  if (isnan(humidity) || isnan(temperature)) {
-    Serial.println("ERROR: DHT22 sensor not responding!");
-    lcd.setCursor(0, 0);
-    lcd.print("Sensor Error!   ");
-    delay(2000);
-    return;
+  // Task 1: Read DHT22 & Refresh Local Alerts + LCD every 2 seconds
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+    lastSensorRead = now;
+    currentTemp = dht.readTemperature();
+    evaluatePlantConditions(currentTemp);
   }
-///////// without conditions
- // Turn RED ON, GREEN OFF
- // Inside your loop() function:
-if (temperature > 50.0) {
- /// Serial.println("hi");
-  // lcd.print("hi");
-  digitalWrite(RED_PIN, HIGH);
-  digitalWrite(GREEN_PIN, LOW);
-  delay(500);
-  digitalWrite(RED_PIN, LOW);
-  digitalWrite(GREEN_PIN, LOW);
-  delay(500);
-} 
-else if (temperature < 10.0) {
- /// Serial.println("Low");
- digitalWrite(RED_PIN, HIGH);
-  digitalWrite(GREEN_PIN, LOW);
-  delay(2000);
 
-   digitalWrite(RED_PIN, LOW);
-  digitalWrite(GREEN_PIN, LOW);
-  delay(2000);
-  // lcd.print("Low");
-} 
-else {
-  digitalWrite(RED_PIN, LOW);
-  digitalWrite(GREEN_PIN, LOW);
-  delay(2000);
-  // lcd.print("normal");
-}
-/////Connect to WiFi
-// Connect to WiFi
-  Serial.println("Connecting to WiFi...");
-
-  WiFi.begin(ssid, password, 6);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Task 2: Push Telemetry to ThingSpeak every 20 seconds
+  if (now - lastCloudSend >= CLOUD_INTERVAL) {
+    lastCloudSend = now;
+    if (!isnan(currentTemp)) {
+      sendTelemetry(currentTemp, currentStatus);
+    }
   }
-  Serial.println();
-  Serial.println("WiFi Connected...");
-
-  Serial.println("IP Address:");
-  Serial.println(WiFi.localIP());
-////////
-  // Print to Serial Monitor
-  Serial.println("======================");
-  Serial.print("Temperature: ");
-  Serial.print(temperature);
-  Serial.println(" C");
-  Serial.print("Humidity: ");
-  Serial.print(humidity);
-  Serial.println(" %");
-//Group 3 projects
-lcd.setCursor(0, 0);
-//lcd.print("GROUP 3: IOT DEVICE TEMP SENSOR");
-  // Display Temperature on Line 1
-  lcd.setCursor(0, 1);
-  lcd.print("Temp: ");
-  lcd.print(temperature, 1);
-  lcd.print((char)223); // Degree symbol
-  lcd.print("C   ");
-
-  // Display Humidity on Line 2
-  lcd.setCursor(0, 2);
-  lcd.print("Humidity: ");
-  lcd.print(humidity, 1);
-  lcd.print("%   ");
-
-  // DHT22 sampling rate is ~0.5 Hz (reads every 2 and 4 seconds)
-  delay(4000);
-  lcd.clear();
-  delay(2000);
-
 }
